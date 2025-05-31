@@ -1,0 +1,215 @@
+#!/bin/sh
+# ==========================================================
+# Merlin Cloudflare DDNS 更新脚本（Cloudflare API v4）
+#
+# 说明     : 在华硕路由器（Asuswrt-Merlin 固件）中，通过 自定义 DDNS（Custom DDNS）功能，将路由器的WAN IPv4 / IPv6 地址自动更新到你在 Cloudflare 注册的子域名 DNS 记录中。
+# 1.安装脚本：将本脚本命名为ddns-start，通过SSH上传到Merlin路由器的/jffs/scripts/目录，运行命令chmod +x /jffs/scripts/ddns-start，赋予其可执行权限。
+# 2.配置路由器 DDNS 设置：登录路由器后台管理界面，前往高级设置 > 外部网络 (WAN) > DDNS，启动DDNS（勾选启用），服务器选择Custom，主机名称填写你在 Cloudflare 中的子域名（建议与脚本中的 RECORD_NAME 保持一致），若该子域名未在 Cloudflare 中创建，脚本将自动创建对应的 A / AAAA 记录，HTTPS/SSL 证书选择自动，点按“应用本页面设置”，此时路由器将立即执行 DDNS 更新，调用本脚本完成 IP 地址同步至 Cloudflare。
+# 3.需要 curl、jq支持。
+
+# 测试型号：路由器：RT-AX88U Pro；固件版本（Firmware）：Asuswrt-Merlin 3004.388.8_2；已安装软件：Merlin Clash2 v0.4.3
+# 作者     : Nianqing
+# 日期     : 2025-05-31
+# 版本     : v1.0.0
+# GitHub   : https://github.com/nianqingnet/merlin-cloudflare-ddns
+# 许可协议 : MIT License
+# 脚本生成参考并优化于 ChatGPT 提供的建议
+# ==========================================================
+
+
+# ====== 设置 PATH 环境变量 ======
+export PATH=/opt/bin:/opt/sbin:/usr/bin:/bin:/usr/sbin:/sbin:/koolshare/bin
+
+# ====== 配置项 ======
+API_TOKEN="Cloudflare API Token"      # 必填：你的Cloudflare API Token | Your Cloudflare API Token
+ZONE_ID="Cloudflare Zone ID"        # 必填：你的 Cloudflare Zone ID | Your Cloudflare Zone ID, hex16 string
+RECORD_NAME="sub.example.com"    # 必填：你的完整子域名 | Full DNS record name, e.g., sub.example.com
+RECORD_TTL=1                    # TTL 秒数（1 表示自动 | TTL in seconds (1 = auto)
+UPDATE_IPv6=false # 是否启用 IPv6（true/false）| Whether to enable IPv6 (true/false)
+PROXIED=false             # 是否使用 Cloudflare 加速（true/false）| Whether to use Cloudflare acceleration (true/false)
+DEBUG=true               # 是否启用调试日志（true/false）| Whether to enable debug logging (true/false)
+# =======================
+
+# 公共 IP 获取地址，可选如：https://4.ipw.cn/
+IP_CHECK_URL="https://ipv4.icanhazip.com"
+
+# === DNS 临时配置文件（Merlin Clash2 的Fake-ip模式会修改/etc/resolv.conf文件，也可以在自定义DNS中添加fake-ip-filter:    - '*.cloudflare.com'参数规避api的连接问题） ===
+ORIGINAL_RESOLV="/etc/resolv.conf"
+TEMP_RESOLV="/tmp/resolv.conf.ddns"
+
+# 替换 resolv.conf 使用指定 DNS
+cat > "$TEMP_RESOLV" <<EOF
+nameserver 223.5.5.5
+nameserver 119.29.29.29
+nameserver 8.8.8.8
+options rotate timeout:1 attempts:2
+EOF
+
+# 备份原始 /etc/resolv.conf 并替换为指定DNS
+cp "$ORIGINAL_RESOLV" "${ORIGINAL_RESOLV}.bak"
+cp "$TEMP_RESOLV" "$ORIGINAL_RESOLV"
+
+log() {
+  if [ "$DEBUG" = true ]; then
+    logger "[DDNS] $1"
+  fi
+}
+
+
+# ========= 获取公网 IPv4 =========
+  IPv4=$(nvram get wan0_ipaddr)
+
+  if [ -z "$IPv4" ] || ! echo "$IPv4" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    log "⚠️ nvram 获取 IPv4 失败，尝试 curl 获取公网 IPv4 地址"
+  IPv4=$(curl -s --connect-timeout 3 "$IP_CHECK_URL" | tr -d '\r\n')
+  fi
+
+  if [ -z "$IPv4" ] || ! echo "$IPv4" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    logger "❌ 无法获取有效公网 IPv4 地址，终止更新"
+    mv "${ORIGINAL_RESOLV}.bak" "$ORIGINAL_RESOLV"
+    exit 1
+  fi
+
+  logger "✅ 获取到公网 IPv4：$IPv4"
+
+# ========= 获取 IPv6（可选） =========
+if [ "$UPDATE_IPv6" = true ]; then
+IPv6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -oP 'src \K[0-9a-f:]+')
+
+# IPv6=$(ip -6 addr show scope global | \
+#   grep -v -E 'fe80|fd[0-9a-f]{2}:' | \
+#   sed -n 's/.*inet6 \([0-9a-f:]*\).*/\1/p' | \
+#   head -n1)
+
+if [ -z "$IPv6" ]; then
+  logger "⚠️ 未能通过路由获取公网 IPv6 地址"
+else
+  logger "✅ 获取到公网 IPv6 地址：$IPv6"
+fi
+fi
+
+
+# === Cloudflare DNS 操作函数定义 ===
+
+get_dns_record_ids() {
+  local type=$1
+  local response
+  response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=${type}&name=${RECORD_NAME}" \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    -H "Content-Type: application/json")
+
+  log "📥 Cloudflare 获取记录 ($type): $response"
+
+  if ! echo "$response" | jq -e '.success == true' >/dev/null; then
+    log "❌ 获取记录失败：$(echo "$response" | jq -c '.errors')"
+    return 1
+  fi
+
+  echo "$response" | jq -r '.result[].id'
+}
+
+create_record() {
+  local type=$1
+  local ip=$2
+
+  local response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "{\"type\":\"${type}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${ip}\",\"ttl\":${RECORD_TTL},\"proxied\":${PROXIED}}")
+
+  log "📡 Cloudflare 返回: $(echo "$response" | jq -c '{success, result, errors}')"
+
+  if echo "$response" | grep -q '"success":\s*true'; then
+    log "✅ 成功创建 $type 记录 $RECORD_NAME → $ip"
+    return 0
+  else
+    log "❌ 创建 $type 记录失败"
+    log "📋 错误详情: $(echo "$response" | jq '.errors')"
+    return 1
+  fi
+}
+
+update_dns_record() {
+  local record_id=$1
+  local type=$2
+  local ip=$3
+
+  RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${record_id}" \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "{\"type\":\"${type}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${ip}\",\"ttl\":${RECORD_TTL},\"proxied\":${PROXIED}}")
+
+  log "✏️ 更新 $type 记录响应：$RESPONSE"
+  echo "$RESPONSE" | grep '"success":\ *true' >/dev/null
+  if [ $? -eq 0 ]; then
+    logger "✅ 成功更新 $type 记录 $RECORD_NAME -> $ip"
+  else
+    logger "❌ 更新 $type 记录失败: $RESPONSE"
+    RESULT=false
+  fi
+}
+
+
+# ========= 主执行逻辑 =========
+RESULT=true
+
+# === 更新 IPv4 DNS 记录 ===
+A_RECORD_IDS=$(get_dns_record_ids A)
+
+if [ -z "$A_RECORD_IDS" ]; then
+  logger "🔍 没有找到 A 记录，尝试创建……"
+
+  if create_record A "$IPv4"; then
+    logger "✅ 成功创建 A 记录，尝试获取 $RECORD_NAME 的 Record ID 并更新。"
+    A_RECORD_IDS=$(get_dns_record_ids A)
+    if [ -n "$A_RECORD_IDS" ]; then
+      update_dns_record "$A_RECORD_IDS" A "$IPv4" || RESULT=false
+    else
+      logger "❌ 创建成功但仍未找到记录 ID。"
+      RESULT=false
+    fi
+  else
+    logger "❌ 创建 $RECORD_NAME的 A 记录失败。"
+    RESULT=false
+  fi
+else
+  log "🌐 获取到的 A 记录 ID: $A_RECORD_IDS"
+  update_dns_record "$A_RECORD_IDS" A "$IPv4" || RESULT=false
+fi
+
+
+# === 更新 IPv6 DNS 记录 ===
+if [ "$UPDATE_IPv6" = true ] && [ -n "$IPv6" ]; then
+  AAAA_ID=$(get_dns_record_ids AAAA)
+  if [ -z "$AAAA_ID" ]; then
+    logger "🔍 未找到 AAAA 记录，尝试创建……"
+    if create_record AAAA "$IPv6"; then
+      logger "✅ 成功创建 AAAA 记录，尝试获取 $RECORD_NAME 的 Record ID 并更新。"
+      AAAA_ID=$(get_dns_record_ids AAAA)
+      if [ -n "$AAAA_ID" ]; then
+        update_dns_record "$AAAA_ID" AAAA "$IPv6" || RESULT=false
+      else
+        logger "❌ 创建成功但无法获取新的 AAAA 记录 ID。"
+        RESULT=false
+      fi
+    else
+      logger "❌ 创建 $RECORD_NAME的 AAAA 记录失败。"
+      RESULT=false
+    fi
+  else
+    update_dns_record "$AAAA_ID" AAAA "$IPv6" || RESULT=false
+  fi
+fi
+
+
+# === 还原原始  /etc/resolv.conf DNS 配置 ===
+mv "${ORIGINAL_RESOLV}.bak" "$ORIGINAL_RESOLV"
+
+# === 通知  Merlin 系统 DDNS 状态 ===
+if [ "$RESULT" = true ]; then
+  /sbin/ddns_custom_updated 1
+  echo "✅ DDNS 更新完成，状态：成功！"
+else
+  /sbin/ddns_custom_updated 0
+  echo "❌ DDNS 更新失败，请检查系统日志。"
+fi
