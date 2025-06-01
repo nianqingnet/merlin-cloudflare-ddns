@@ -2,7 +2,7 @@
 
 一个用于在 ASUS Merlin 路由器上通过 Cloudflare API 自动更新路由器 IPv4 / IPv6 DNS 记录到 Cloudflare 注册子域名的 Shell 脚本。
 
-> 支持 A 与 AAAA 记录、Cloudflare 加速（建议false）、Fake-IP 兼容处理、日志调试等功能。
+> 支持 A 与 AAAA 记录、Cloudflare 加速（慎用）、Fake-IP 兼容处理、日志调试等功能。
 
 ---
 
@@ -10,7 +10,7 @@
 
 - ✅ 支持 Cloudflare API v4
 - ✅ 自动更新 A（IPv4）和 AAAA（IPv6）记录
-- ✅ 支持 Cloudflare Proxy（CDN 加速）
+- ✅ 支持 Cloudflare Proxy（CDN 加速；会阻挡非标准端口/协议；如本机服务（如远程桌面、NAS、某些 HTTP/HTTPS 服务）未正确配置Cloudflare支持，会无法连接。）
 - ✅ 支持 Fake-IP DNS 修正（如用于 Merlin Clash2）
 - ✅ 兼容 `ddns-start` 脚本机制
 - ✅ 易于配置、无需 crontab
