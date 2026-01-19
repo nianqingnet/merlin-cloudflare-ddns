@@ -9,11 +9,11 @@
 
 # 测试型号：路由器：RT-AX88U Pro；固件版本（Firmware）：Asuswrt-Merlin 3004.388.8_2；已安装软件：Merlin Clash2 v0.4.3
 # 作者     : Nianqing
-# 日期     : 2025-05-31
-# 版本     : v1.0.0
+# 日期     : 2026-01-15
+# 版本     : v1.0.1
 # GitHub   : https://github.com/nianqingnet/merlin-cloudflare-ddns
 # 许可协议 : MIT License
-# 脚本生成参考并优化于 ChatGPT 提供的建议
+# 脚本生成参考并优化于 ChatGPT 、gemini提供的建议
 # ==========================================================
 
 
@@ -37,6 +37,18 @@ IP_CHECK_URL="https://ipv4.icanhazip.com"
 ORIGINAL_RESOLV="/etc/resolv.conf"
 TEMP_RESOLV="/tmp/resolv.conf.ddns"
 
+# 防御性检查：防止某种极端 BUG 导致 RECORD_NAME 变成空字符串，如API Token 权限过大，删除重复DNS记录的逻辑可能会尝试删除该 Zone 下的所有记录（虽然 Cloudflare API 通常会因为参数不全报错拦截）。
+if [ -z "$RECORD_NAME" ] || [ -z "$ZONE_ID" ] || [ -z "$API_TOKEN" ]; then
+    logger "[DDNS] ❌ 配置缺失，脚本终止"
+    exit 1
+fi
+
+log() {
+    [ "$DEBUG" = true ] && logger "[DDNS] $1"
+}
+
+
+
 # 替换 resolv.conf 使用指定 DNS
 cat > "$TEMP_RESOLV" <<EOF
 nameserver 223.5.5.5
@@ -49,11 +61,6 @@ EOF
 cp "$ORIGINAL_RESOLV" "${ORIGINAL_RESOLV}.bak"
 cp "$TEMP_RESOLV" "$ORIGINAL_RESOLV"
 
-log() {
-  if [ "$DEBUG" = true ]; then
-    logger "[DDNS] $1"
-  fi
-}
 
 
 # ========= 获取公网 IPv4 =========
@@ -89,24 +96,54 @@ fi
 fi
 
 
-# === Cloudflare DNS 操作函数定义 ===
+# === Cloudflare DNS API 操作函数定义 ===
 
-get_dns_record_ids() {
-  local type=$1
-  local response
-  response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=${type}&name=${RECORD_NAME}" \
-    -H "Authorization: Bearer ${API_TOKEN}" \
-    -H "Content-Type: application/json")
-
-  log "📥 Cloudflare 获取记录 ($type): $response"
-
-  if ! echo "$response" | jq -e '.success == true' >/dev/null; then
-    log "❌ 获取记录失败：$(echo "$response" | jq -c '.errors')"
-    return 1
-  fi
-
-  echo "$response" | jq -r '.result[].id'
+# 辅助函数：删除指定的记录 ID
+delete_record() {
+    local rid=$1
+    curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${rid}" \
+         -H "Authorization: Bearer ${API_TOKEN}" \
+         -H "Content-Type: application/json" > /dev/null
 }
+
+# 获取并自动清理重复记录
+get_dns_record_ids() {
+    local type=$1
+    local response
+    response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?type=${type}&name=${RECORD_NAME}" \
+        -H "Authorization: Bearer ${API_TOKEN}" \
+        -H "Content-Type: application/json")
+     log "📥 Cloudflare 获取记录 ($type): $response"
+
+    if ! echo "$response" | jq -e '.success == true' >/dev/null; then
+        log "❌ 获取记录失败：$(echo "$response" | jq -c '.errors')"
+        return 1
+    fi
+
+# 获取所有匹配的 ID 列表
+    local ids=$(echo "$response" | jq -r '.result[].id')
+    
+    # 转换为位置参数
+    set -- $ids
+    local count=$#
+
+    if [ "$count" -gt 1 ]; then
+        logger "⚠️ 发现 $count 条重复的 $type 记录，启动自动清理..."
+        local first_id=$1
+        shift # 移除第一个 ID
+        for redundant_id in "$@"; do
+        log "🗑️ 正在删除冗余记录 ID: $redundant_id"
+            delete_record "$redundant_id"
+        done
+        # 返回保留的那一个 ID
+        echo "$first_id"
+    else
+        # 正常情况：只有 1 条或 0 条时，直接输出（空或单个 ID）
+        echo "$ids"
+    fi
+}
+
+
 
 create_record() {
   local type=$1
